@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"distribute_video_streaming_chunking_platform/internal/constants"
-	"distribute_video_streaming_chunking_platform/internal/helpers"
-	"distribute_video_streaming_chunking_platform/internal/service"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/constants"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/helpers"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/service"
 )
 
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +79,7 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 
-		if err := services.ProcessVideo(
+		if err := service.ProcessVideo(
 			inputPath,
 			outputFolder,
 		); err != nil {

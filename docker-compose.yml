@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: video-platform-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: video_app
+      POSTGRES_PASSWORD: pass@4588
+      POSTGRES_DB: video_platform
+      TZ: Asia/Kolkata
+      PGTZ: Asia/Kolkata
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U video_app -d video_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

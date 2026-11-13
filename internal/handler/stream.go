@@ -3,7 +3,7 @@ package handlers
 import (
 	"net/http"
 
-	"distribute_video_streaming_chunking_platform/internal/constants"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/constants"
 )
 
 func StreamHandler() http.Handler {

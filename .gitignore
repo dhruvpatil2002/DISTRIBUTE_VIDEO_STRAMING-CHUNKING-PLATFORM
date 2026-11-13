@@ -1,19 +1,15 @@
-# Uploaded videos
+
+.env
 uploads/
 hls/
+web/node_modules/
+web/dist/
 
-# Executables
 *.exe
 *.out
 *.test
 
-# IDE
 .vscode/
 .idea/
-
-# Environment files
-.env
-
-# OS files
 .DS_Store
 Thumbs.db

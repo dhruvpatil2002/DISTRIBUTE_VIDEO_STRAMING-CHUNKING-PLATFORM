@@ -1,4 +1,4 @@
-package services
+package service
 
 import (
 	"fmt"
@@ -9,9 +9,9 @@ import (
 	"sort"
 	"sync"
 
-	"distribute_video_streaming_chunking_platform/internal/constants"
-	"distribute_video_streaming_chunking_platform/internal/helpers"
-	"distribute_video_streaming_chunking_platform/internal/models"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/constants"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/helpers"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/models"
 )
 
 func ProcessVideo(

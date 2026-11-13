@@ -1,55 +1,115 @@
+
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
-	"path/filepath"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"distribute_video_streaming_chunking_platform/internal/constants"
-	"distribute_video_streaming_chunking_platform/internal/helpers"
-	"distribute_video_streaming_chunking_platform/internal/routes"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/config"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/database"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/middleware"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/routes"
 )
 
 func main() {
 
-	// Resolve absolute directories
-	uploadPath, err := filepath.Abs(constants.UploadDir)
+	// Load configuration
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Upload path error: %v", err)
+		log.Fatalf("Configuration error: %v", err)
 	}
 
-	hlsPath, err := filepath.Abs(constants.HLSDir)
+	log.Printf("Starting application in %s mode", cfg.AppEnv)
+
+	// Create startup context
+	startupCtx, cancel := context.WithTimeout(
+		context.Background(),
+		15*time.Second,
+	)
+	defer cancel()
+
+	// Initialize PostgreSQL
+	db, err := database.NewPostgres(
+		startupCtx,
+		cfg.DatabaseURL,
+		cfg.DBMaxConns,
+		cfg.DBMinConns,
+	)
 	if err != nil {
-		log.Fatalf("HLS path error: %v", err)
+		log.Fatalf("Database connection failed: %v", err)
 	}
+	defer db.Close()
 
-	// Initialize directories
-	if err := helpers.EnsureDirectory(uploadPath); err != nil {
-		log.Fatalf("Upload directory error: %v", err)
-	}
-
-	if err := helpers.EnsureDirectory(hlsPath); err != nil {
-		log.Fatalf("HLS directory error: %v", err)
+	// Run migrations
+	if err := database.RunMigrations(startupCtx, db); err != nil {
+		log.Fatalf("Database migration failed: %v", err)
 	}
 
 	// Register routes
-	routes.RegisterRoutes()
+	handler, shutdownStreams, err := routes.New(db, cfg)
+if err != nil {
+    log.Fatalf("Route initialization failed: %v", err)
+}
+defer shutdownStreams()
 
-	// Start server
+	// Add middleware
+	handler = middleware.RequestLogger(handler)
+
+	// Configure HTTP server
 	server := &http.Server{
-		Addr:              constants.ServerAddress,
+		Addr:              cfg.HTTPAddr,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Println("================================")
-	log.Println("HLS Video Server Started")
-	log.Println("Upload: http://localhost:8080/upload")
-	log.Println("Stream: http://localhost:8080/hls/")
-	log.Println("================================")
+	// Listen for shutdown signals
+	shutdownCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
 
-	if err := server.ListenAndServe(); err != nil &&
-		err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
+	serverError := make(chan error, 1)
+
+	go func() {
+		log.Printf("API server running at http://localhost%s", cfg.HTTPAddr)
+
+		serverError <- server.ListenAndServe()
+	}()
+
+	select {
+
+	case err := <-serverError:
+
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+
+	case <-shutdownCtx.Done():
+
+		log.Println("Shutdown signal received")
+
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+			_ = server.Close()
+		}
+
+		log.Println("Server stopped")
 	}
 }

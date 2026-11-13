@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"distribute_video_streaming_chunking_platform/internal/models"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/models"
 )
 
 func GenerateMasterPlaylist(
