@@ -1,0 +1,19 @@
+# Uploaded videos
+uploads/
+hls/
+
+# Executables
+*.exe
+*.out
+*.test
+
+# IDE
+.vscode/
+.idea/
+
+# Environment files
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
