@@ -12,8 +12,8 @@ import (
 )
 
 var (
-    ErrInvalidInput = errors.New("invalid input")
-    ErrNotFound     = errors.New("resource not found")
+    ErrInvalidSiteInput = errors.New("invalid input")
+    ErrNotFound         = errors.New("resource not found")
 )
 
 type SiteService struct {
@@ -65,11 +65,23 @@ func (s *SiteService) Create(
 }
 
 func (s *SiteService) GetAll(
-    ctx context.Context,
-    userID string,
-) ([]models.Site, error) {
+	ctx context.Context,
+	userID string,
+	limit int,
+	cursor string,
+) (*repository.SitePage, error) {
 
-    return s.Repo.GetAll(ctx, userID)
+	decodedCursor, err := repository.DecodeSiteCursor(cursor)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.Repo.GetAll(
+		ctx,
+		userID,
+		limit,
+		decodedCursor,
+	)
 }
 
 func (s *SiteService) GetByID(

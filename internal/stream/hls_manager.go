@@ -2,12 +2,14 @@
 package stream
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,11 +19,11 @@ import (
 )
 
 var (
-	ErrLeaseExpired = errors.New("playback lease expired")
-	ErrStreamFailed = errors.New("stream failed")
-	ErrLeaseForbidden = errors.New(
-    "playback lease does not belong to user",
-))
+	ErrLeaseExpired   = errors.New("playback lease expired")
+	ErrLeaseForbidden = errors.New("playback lease forbidden")
+	ErrStreamFailed   = errors.New("stream failed")
+	ErrManagerClosed  = errors.New("stream manager closed")
+)
 
 type StreamStatus string
 
@@ -41,16 +43,19 @@ type ViewerLease struct {
 }
 
 type CameraProcess struct {
-	Cmd       *exec.Cmd
-	Cancel    context.CancelFunc
-	Viewers   map[string]struct{}
-	Timer     *time.Timer
-	Dir       string
+	Ctx    context.Context
+	Cancel context.CancelFunc
+
+	Viewers map[string]struct{}
+	Dir     string
+
 	Status    StreamStatus
-	Ready     chan struct{}
-	Done      chan struct{}
-	ReadyOnce sync.Once
 	LastError string
+
+	Done    chan struct{}
+	Changed chan struct{}
+
+	StopTimer *time.Timer
 }
 
 type HLSManager struct {
@@ -59,17 +64,17 @@ type HLSManager struct {
 	processes map[string]*CameraProcess
 	leases    map[string]*ViewerLease
 
-	ffmpegPath string
-	hlsDir     string
-
-	gracePeriod time.Duration
-	leaseTTL    time.Duration
+	ffmpegPath   string
+	hlsDir       string
+	gracePeriod  time.Duration
+	leaseTTL     time.Duration
 	readyTimeout time.Duration
-	maxRestarts int
+	maxRestarts  int
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+
+	wg sync.WaitGroup
 }
 
 func generateLeaseID() (string, error) {
@@ -91,9 +96,9 @@ func NewHLSManager(
 	maxRestarts int,
 ) *HLSManager {
 
-	ctx, cancel := context.WithCancel(
-		context.Background(),
-	)
+	if ffmpegPath == "" {
+		ffmpegPath = "ffmpeg"
+	}
 
 	if gracePeriod <= 0 {
 		gracePeriod = 30 * time.Second
@@ -110,6 +115,8 @@ func NewHLSManager(
 	if maxRestarts < 0 {
 		maxRestarts = 0
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &HLSManager{
 		processes:    make(map[string]*CameraProcess),
@@ -130,17 +137,45 @@ func NewHLSManager(
 	return m
 }
 
+// Must be called while holding m.mu.
+func (m *HLSManager) notifyLocked(p *CameraProcess) {
+	close(p.Changed)
+	p.Changed = make(chan struct{})
+}
+
+func validCameraID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+
+	for i, ch := range id {
+		switch i {
+		case 8, 13, 18, 23:
+			if ch != '-' {
+				return false
+			}
+		default:
+			if !((ch >= '0' && ch <= '9') ||
+				(ch >= 'a' && ch <= 'f') ||
+				(ch >= 'A' && ch <= 'F')) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 func (m *HLSManager) Acquire(
-	cameraID string,
-	rtspURL string,
-	 userID string,
+	cameraID, rtspURL, userID string,
 ) (string, string, error) {
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !validCameraID(cameraID) {
+		return "", "", errors.New("invalid camera UUID")
+	}
 
-	if m.ctx.Err() != nil {
-		return "", "", errors.New("stream manager shutting down")
+	if rtspURL == "" || userID == "" {
+		return "", "", errors.New("missing playback parameters")
 	}
 
 	leaseID, err := generateLeaseID()
@@ -148,54 +183,56 @@ func (m *HLSManager) Acquire(
 		return "", "", err
 	}
 
-	process := m.processes[cameraID]
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if process == nil {
-
-		outputDir := filepath.Join(
-			m.hlsDir,
-			cameraID,
-		)
-
-		if err := os.RemoveAll(outputDir); err != nil {
-			return "", "", err
-		}
-
-		for _, quality := range []string{
-			"1080p",
-			"720p",
-			"480p",
-		} {
-			if err := os.MkdirAll(
-				filepath.Join(outputDir, quality),
-				0750,
-			); err != nil {
-				return "", "", err
-			}
-		}
-
-		process = &CameraProcess{
-			Viewers: make(map[string]struct{}),
-			Dir:     outputDir,
-			Status:  StreamStarting,
-			Ready:   make(chan struct{}),
-			Done:    make(chan struct{}),
-		}
-
-		m.processes[cameraID] = process
-
-		m.wg.Add(1)
-		go m.supervise(cameraID, rtspURL, process)
+	if m.ctx.Err() != nil {
+		return "", "", ErrManagerClosed
 	}
 
-	if process.Timer != nil {
-		process.Timer.Stop()
-		process.Timer = nil
+	p := m.processes[cameraID]
+
+	if p != nil && p.Status == StreamFailed {
+		delete(m.processes, cameraID)
+		p.Cancel()
+		p = nil
+	}
+
+	if p == nil {
+		dir := filepath.Join(m.hlsDir, cameraID)
+
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return "", "", fmt.Errorf("create HLS directory: %w", err)
+		}
+
+		ctx, cancel := context.WithCancel(m.ctx)
+
+		p = &CameraProcess{
+			Ctx:     ctx,
+			Cancel:  cancel,
+			Viewers: make(map[string]struct{}),
+			Dir:     dir,
+			Status:  StreamStarting,
+			Done:    make(chan struct{}),
+			Changed: make(chan struct{}),
+		}
+
+		m.processes[cameraID] = p
+
+		m.wg.Add(1)
+		go m.supervise(cameraID, rtspURL, p)
+
+		log.Printf("[HLS] Created camera process camera=%s", cameraID)
+	}
+
+	if p.StopTimer != nil {
+		p.StopTimer.Stop()
+		p.StopTimer = nil
 	}
 
 	now := time.Now()
 
-	process.Viewers[leaseID] = struct{}{}
+	p.Viewers[leaseID] = struct{}{}
 
 	m.leases[leaseID] = &ViewerLease{
 		ID:        leaseID,
@@ -204,6 +241,12 @@ func (m *HLSManager) Acquire(
 		LastSeen:  now,
 		ExpiresAt: now.Add(m.leaseTTL),
 	}
+
+	log.Printf(
+		"[HLS] Viewer acquired camera=%s viewers=%d",
+		cameraID,
+		len(p.Viewers),
+	)
 
 	playlistURL := fmt.Sprintf(
 		"/hls/streams/%s/master.m3u8",
@@ -218,156 +261,523 @@ func (m *HLSManager) WaitUntilReady(
 	cameraID string,
 ) error {
 
-	m.mu.Lock()
+	ctx, cancel := context.WithTimeout(ctx, m.readyTimeout)
+	defer cancel()
 
-	process := m.processes[cameraID]
-
-	m.mu.Unlock()
-
-	if process == nil {
-		return ErrStreamFailed
-	}
-
-	select {
-	case <-process.Ready:
+	for {
 		m.mu.Lock()
-		status := process.Status
-		m.mu.Unlock()
 
-		if status != StreamReady {
+		p := m.processes[cameraID]
+		if p == nil {
+			m.mu.Unlock()
 			return ErrStreamFailed
 		}
 
-		return nil
+		status := p.Status
+		lastError := p.LastError
+		changed := p.Changed
+		done := p.Done
 
-	case <-process.Done:
-		return ErrStreamFailed
+		m.mu.Unlock()
 
-	case <-ctx.Done():
-		return ctx.Err()
+		switch status {
+		case StreamReady:
+			return nil
+
+		case StreamFailed:
+			return fmt.Errorf(
+				"%w: %s",
+				ErrStreamFailed,
+				lastError,
+			)
+		}
+
+		select {
+		case <-changed:
+			continue
+
+		case <-done:
+			return ErrStreamFailed
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+}
+
+func (m *HLSManager) supervise(
+	cameraID, rtspURL string,
+	p *CameraProcess,
+) {
+	defer m.wg.Done()
+	defer close(p.Done)
+
+	for attempt := 0; attempt <= m.maxRestarts; attempt++ {
+		if p.Ctx.Err() != nil {
+			return
+		}
+
+		m.mu.Lock()
+
+		if m.processes[cameraID] != p {
+			m.mu.Unlock()
+			return
+		}
+
+		if attempt == 0 {
+			p.Status = StreamStarting
+		} else {
+			p.Status = StreamRecovering
+		}
+
+		m.notifyLocked(p)
+		m.mu.Unlock()
+
+		log.Printf(
+			"[HLS] Starting camera=%s attempt=%d",
+			cameraID,
+			attempt+1,
+		)
+
+		err := m.startFFmpeg(cameraID, p, rtspURL)
+
+		if p.Ctx.Err() != nil {
+			return
+		}
+
+		m.mu.Lock()
+
+		if m.processes[cameraID] != p {
+			m.mu.Unlock()
+			return
+		}
+
+		if err != nil {
+			p.LastError = err.Error()
+		}
+
+		p.Status = StreamRecovering
+		m.notifyLocked(p)
+
+		m.mu.Unlock()
+
+		log.Printf(
+			"[HLS] Camera=%s FFmpeg stopped: %v",
+			cameraID,
+			err,
+		)
+
+		if attempt == m.maxRestarts {
+			m.mu.Lock()
+
+			if m.processes[cameraID] == p {
+				p.Status = StreamFailed
+				m.notifyLocked(p)
+			}
+
+			m.mu.Unlock()
+
+			log.Printf("[HLS] Camera=%s failed permanently", cameraID)
+			return
+		}
+
+		delay := time.Second * time.Duration(1<<min(attempt, 5))
+
+		timer := time.NewTimer(delay)
+
+		select {
+		case <-p.Ctx.Done():
+			timer.Stop()
+			return
+
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *HLSManager) startFFmpeg(
+	cameraID string,
+	p *CameraProcess,
+	rtspURL string,
+) error {
+
+	ctx, cancel := context.WithCancel(p.Ctx)
+	defer cancel()
+
+	// Remove old HLS output before starting a new generation.
+	// This directory must be dedicated to this camera.
+	if err := os.RemoveAll(p.Dir); err != nil {
+		return fmt.Errorf("clean old HLS files: %w", err)
+	}
+
+	if err := os.MkdirAll(p.Dir, 0750); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+
+	for _, variant := range []string{"0", "1", "2"} {
+		dir := filepath.Join(p.Dir, variant)
+
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return fmt.Errorf(
+				"create variant directory %s: %w",
+				dir,
+				err,
+			)
+		}
+	}
+
+	args := buildFFmpegArgs(rtspURL, p.Dir)
+
+	cmd := exec.CommandContext(
+		ctx,
+		m.ffmpegPath,
+		args...,
+	)
+
+	// Never print RTSP credentials or the full command.
+	cmd.Stdout = io.Discard
+	cmd.Stderr = os.Stderr
+
+	log.Printf("[HLS] Starting FFmpeg camera=%s", cameraID)
+	log.Printf("[HLS] Output directory=%s", p.Dir)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start FFmpeg: %w", err)
+	}
+
+	log.Printf(
+		"[HLS] FFmpeg started camera=%s PID=%d",
+		cameraID,
+		cmd.Process.Pid,
+	)
+
+	waitResult := make(chan error, 1)
+
+	go func() {
+		waitResult <- cmd.Wait()
+	}()
+
+	readyCtx, readyCancel := context.WithTimeout(
+		ctx,
+		m.readyTimeout,
+	)
+	defer readyCancel()
+
+	readyResult := make(chan error, 1)
+
+	go func() {
+		readyResult <- waitForHLS(readyCtx, p.Dir)
+	}()
+
+	select {
+	case err := <-readyResult:
+		if err != nil {
+			cancel()
+			<-waitResult
+			return fmt.Errorf("HLS readiness failed: %w", err)
+		}
+
+	case err := <-waitResult:
+		cancel()
+
+		if err == nil {
+			return errors.New("FFmpeg exited before HLS readiness")
+		}
+
+		return fmt.Errorf("FFmpeg exited: %w", err)
+
+	case <-readyCtx.Done():
+		cancel()
+		<-waitResult
+		return fmt.Errorf("HLS readiness timeout: %w", readyCtx.Err())
+	}
+
+	// Check whether FFmpeg has already exited.
+	select {
+	case err := <-waitResult:
+		if err == nil {
+			return errors.New("FFmpeg exited after HLS readiness")
+		}
+		return fmt.Errorf("FFmpeg exited: %w", err)
+	default:
+	}
+
+	m.mu.Lock()
+
+	if p.Ctx.Err() == nil && m.processes[cameraID] == p {
+		p.Status = StreamReady
+		p.LastError = ""
+		m.notifyLocked(p)
+	}
+
+	m.mu.Unlock()
+
+	log.Printf("[HLS] Camera=%s stream READY", cameraID)
+
+	select {
+	case err := <-waitResult:
+		if err != nil {
+			return fmt.Errorf("FFmpeg exited: %w", err)
+		}
+
+		return errors.New("FFmpeg exited unexpectedly")
+
+	case <-p.Ctx.Done():
+		cancel()
+		<-waitResult
+		return p.Ctx.Err()
+	}
+}
+
+func buildFFmpegArgs(rtspURL, outputDir string) []string {
+	return []string{
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-nostdin",
+
+		"-rtsp_transport", "tcp",
+		"-i", rtspURL,
+
+		"-map", "0:v:0",
+		"-map", "0:v:0",
+		"-map", "0:v:0",
+
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-pix_fmt", "yuv420p",
+
+		"-filter:v:0",
+		"scale=w=1920:h=1080:force_original_aspect_ratio=decrease",
+		"-b:v:0", "5000k",
+		"-maxrate:v:0", "5350k",
+		"-bufsize:v:0", "7500k",
+
+		"-filter:v:1",
+		"scale=w=1280:h=720:force_original_aspect_ratio=decrease",
+		"-b:v:1", "2800k",
+		"-maxrate:v:1", "2996k",
+		"-bufsize:v:1", "4200k",
+
+		"-filter:v:2",
+		"scale=w=854:h=480:force_original_aspect_ratio=decrease",
+		"-b:v:2", "1400k",
+		"-maxrate:v:2", "1498k",
+		"-bufsize:v:2", "2100k",
+
+		"-r", "30",
+		"-g", "60",
+		"-keyint_min", "60",
+		"-sc_threshold", "0",
+
+		"-f", "hls",
+		"-hls_time", "2",
+		"-hls_list_size", "6",
+		"-hls_flags", "delete_segments+independent_segments",
+		"-hls_segment_type", "mpegts",
+
+		"-var_stream_map", "v:0 v:1 v:2",
+		"-master_pl_name", "master.m3u8",
+
+		"-hls_segment_filename",
+		filepath.Join(outputDir, "%v", "segment_%06d.ts"),
+
+		filepath.Join(outputDir, "%v", "index.m3u8"),
+	}
+}
+
+// waitForHLS waits for a master playlist and a real video segment.
+// It must honor context cancellation.
+func waitForHLS(
+	ctx context.Context,
+	outputDir string,
+) error {
+
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if err := checkHLSReady(outputDir); err == nil {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"waiting for HLS files: %w",
+				ctx.Err(),
+			)
+
+		case <-ticker.C:
+		}
+	}
+}
+
+func checkHLSReady(outputDir string) error {
+	masterPath := filepath.Join(outputDir, "master.m3u8")
+
+	master, err := os.ReadFile(masterPath)
+	if err != nil {
+		return err
+	}
+
+	if !strings.HasPrefix(string(master), "#EXTM3U") {
+		return errors.New("invalid master playlist")
+	}
+
+	for _, variant := range []string{"0", "1", "2"} {
+		variantDir := filepath.Join(outputDir, variant)
+		playlistPath := filepath.Join(variantDir, "index.m3u8")
+
+		playlist, err := os.Open(playlistPath)
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(playlist)
+
+		var segmentName string
+
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+
+			if strings.HasSuffix(line, ".ts") {
+				segmentName = line
+				break
+			}
+		}
+
+		scanErr := scanner.Err()
+		_ = playlist.Close()
+
+		if scanErr != nil || segmentName == "" {
+			continue
+		}
+
+		// Only accept the segment filename, not arbitrary paths.
+		if filepath.Base(segmentName) != segmentName {
+			continue
+		}
+
+		segmentPath := filepath.Join(variantDir, segmentName)
+
+		info, err := os.Stat(segmentPath)
+		if err == nil && info.Size() > 0 {
+			return nil
+		}
+	}
+
+	return errors.New("no playable HLS segment found")
 }
 
 func (m *HLSManager) Heartbeat(
-    leaseID string,
-    userID string,
+	leaseID, userID string,
 ) error {
-
-    m.mu.Lock()
-    defer m.mu.Unlock()
-
-    lease, exists := m.leases[leaseID]
-
-    if !exists {
-        return ErrLeaseExpired
-    }
-
-    if lease.UserID != userID {
-        return ErrLeaseForbidden
-    }
-
-    now := time.Now()
-
-    if !now.Before(lease.ExpiresAt) {
-        m.releaseLocked(lease)
-        return ErrLeaseExpired
-    }
-
-    lease.LastSeen = now
-    lease.ExpiresAt = now.Add(m.leaseTTL)
-
-    return nil
-}
-func (m *HLSManager) Release(leaseID string) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	lease, exists := m.leases[leaseID]
+	lease, ok := m.leases[leaseID]
+	if !ok {
+		return ErrLeaseExpired
+	}
 
-	if !exists {
-		return
+	if lease.UserID != userID {
+		return ErrLeaseForbidden
+	}
+
+	now := time.Now()
+
+	if !now.Before(lease.ExpiresAt) {
+		m.releaseLocked(lease)
+		return ErrLeaseExpired
+	}
+
+	lease.LastSeen = now
+	lease.ExpiresAt = now.Add(m.leaseTTL)
+
+	return nil
+}
+
+func (m *HLSManager) Release(
+	leaseID, userID string,
+) error {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	lease, ok := m.leases[leaseID]
+	if !ok {
+		return ErrLeaseExpired
+	}
+
+	if lease.UserID != userID {
+		return ErrLeaseForbidden
+	}
+
+	if !time.Now().Before(lease.ExpiresAt) {
+		m.releaseLocked(lease)
+		return ErrLeaseExpired
 	}
 
 	m.releaseLocked(lease)
+	return nil
 }
 
-func (m *HLSManager) releaseLocked(
-	lease *ViewerLease,
-) {
-
+// Must be called while holding m.mu.
+func (m *HLSManager) releaseLocked(lease *ViewerLease) {
 	delete(m.leases, lease.ID)
 
-	process := m.processes[lease.CameraID]
-
-	if process == nil {
+	p := m.processes[lease.CameraID]
+	if p == nil {
 		return
 	}
 
-	delete(process.Viewers, lease.ID)
+	delete(p.Viewers, lease.ID)
 
-	if len(process.Viewers) != 0 {
+	if len(p.Viewers) > 0 {
 		return
 	}
 
-	if process.Timer != nil {
-		process.Timer.Stop()
+	if p.StopTimer != nil {
+		p.StopTimer.Stop()
 	}
 
-	process.Timer = time.AfterFunc(
-		m.gracePeriod,
-		func() {
-			m.stopIfUnused(
-				lease.CameraID,
-				process,
-			)
-		},
-	)
-}
+	cameraID := lease.CameraID
 
-func (m *HLSManager) stopIfUnused(
-	cameraID string,
-	process *CameraProcess,
-) {
+	p.StopTimer = time.AfterFunc(m.gracePeriod, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+		if m.processes[cameraID] != p {
+			return
+		}
 
-	current := m.processes[cameraID]
+		if len(p.Viewers) != 0 {
+			return
+		}
 
-	if current != process {
-		return
-	}
+		log.Printf("[HLS] Stopping idle camera=%s", cameraID)
 
-	if len(process.Viewers) != 0 {
-		return
-	}
-
-	delete(m.processes, cameraID)
-
-	process.Cancel()
+		delete(m.processes, cameraID)
+		p.Cancel()
+	})
 }
 
 func (m *HLSManager) expirationLoop() {
-
 	defer m.wg.Done()
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
-
 		select {
-
 		case <-m.ctx.Done():
 			return
 
 		case now := <-ticker.C:
-
 			m.mu.Lock()
 
 			for _, lease := range m.leases {
-
 				if !now.Before(lease.ExpiresAt) {
 					m.releaseLocked(lease)
 				}
@@ -378,246 +788,47 @@ func (m *HLSManager) expirationLoop() {
 	}
 }
 
-func (m *HLSManager) supervise(
-	cameraID string,
-	rtspURL string,
-	process *CameraProcess,
-) {
+// StopCamera stops the camera process and invalidates its leases.
+// Call this when deleting or disabling a camera.
+func (m *HLSManager) StopCamera(cameraID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	defer m.wg.Done()
-	defer close(process.Done)
-
-	var restartCount int
-
-	for {
-
-		if m.ctx.Err() != nil {
-			return
-		}
-
-		m.mu.Lock()
-
-		current := m.processes[cameraID]
-
-		if current != process {
-			m.mu.Unlock()
-			return
-		}
-
-		if len(process.Viewers) == 0 {
-			m.mu.Unlock()
-			return
-		}
-
-		if restartCount > 0 {
-			process.Status = StreamRecovering
-		} else {
-			process.Status = StreamStarting
-		}
-
-		m.mu.Unlock()
-
-		if err := m.startFFmpeg(
-			process,
-			rtspURL,
-		); err != nil {
-
-			m.mu.Lock()
-			process.LastError = err.Error()
-			m.mu.Unlock()
-		}
-
-		select {
-
-		case <-process.CancelContext().Done():
-			return
-
-		default:
-		}
-
-		if restartCount >= m.maxRestarts {
-			m.mu.Lock()
-			process.Status = StreamFailed
-			m.mu.Unlock()
-			return
-		}
-
-		restartCount++
-
-		delay := time.Second * time.Duration(
-			1<<min(restartCount-1, 5),
-		)
-
-		if delay > 30*time.Second {
-			delay = 30 * time.Second
-		}
-
-		timer := time.NewTimer(delay)
-
-		select {
-
-		case <-m.ctx.Done():
-			timer.Stop()
-			return
-
-		case <-timer.C:
-		}
-
-		m.mu.Lock()
-		hasViewers := len(process.Viewers) > 0
-		current = m.processes[cameraID]
-		m.mu.Unlock()
-
-		if !hasViewers || current != process {
-			return
-		}
-	}
-}
-
-// startFFmpeg owns each individual FFmpeg process.
-// Only the supervisor calls this function.
-
-func (m *HLSManager) startFFmpeg(
-	process *CameraProcess,
-	rtspURL string,
-) error {
-
-	processCtx, cancel := context.WithCancel(m.ctx)
-
-	process.Cancel = cancel
-
-	cmd := exec.CommandContext(
-		processCtx,
-		m.ffmpegPath,
-		buildFFmpegArgs(rtspURL, process.Dir)...,
-	)
-
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("start ffmpeg: %w", err)
+	p := m.processes[cameraID]
+	if p == nil {
+		return
 	}
 
-	process.Cmd = cmd
-
-	readyCtx, readyCancel := context.WithTimeout(
-		processCtx,
-		m.readyTimeout,
-	)
-
-	readyErr := WaitForHLS(
-		readyCtx,
-		process.Dir,
-	)
-
-	readyCancel()
-
-	if readyErr == nil {
-		m.mu.Lock()
-
-		process.Status = StreamReady
-		process.LastError = ""
-
-		process.ReadyOnce.Do(func() {
-			close(process.Ready)
-		})
-
-		m.mu.Unlock()
+	if p.StopTimer != nil {
+		p.StopTimer.Stop()
 	}
 
-	waitErr := cmd.Wait()
-
-	cancel()
-
-	if waitErr != nil {
-		return fmt.Errorf("ffmpeg exited: %w", waitErr)
+	for leaseID := range p.Viewers {
+		delete(m.leases, leaseID)
 	}
 
-	if readyErr != nil {
-		return fmt.Errorf("HLS readiness: %w", readyErr)
-	}
+	delete(m.processes, cameraID)
+	p.Cancel()
 
-	return errors.New("ffmpeg exited unexpectedly")
-}
-
-// CancelContext returns the current process context.
-// A process cancellation is controlled by its supervisor.
-
-func (p *CameraProcess) CancelContext() context.Context {
-	// The supervisor uses the manager context for shutdown.
-	// Process completion is detected through Cmd.Wait().
-	return context.Background()
+	log.Printf("[HLS] Camera stopped camera=%s", cameraID)
 }
 
 func (m *HLSManager) Shutdown() {
-
 	m.cancel()
 
 	m.mu.Lock()
 
-	for _, process := range m.processes {
-		if process.Timer != nil {
-			process.Timer.Stop()
+	for _, p := range m.processes {
+		if p.StopTimer != nil {
+			p.StopTimer.Stop()
 		}
 
-		if process.Cancel != nil {
-			process.Cancel()
-		}
+		p.Cancel()
 	}
 
 	m.mu.Unlock()
 
 	m.wg.Wait()
-}
 
-func buildFFmpegArgs(
-	rtspURL string,
-	outputDir string,
-) []string {
-
-	filter := strings.Join([]string{
-		"[0:v]split=3[v1][v2][v3]",
-		"[v1]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2[v1080]",
-		"[v2]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2[v720]",
-		"[v3]scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2[v480]",
-	}, ";")
-
-	return []string{
-		"-hide_banner",
-		"-loglevel", "warning",
-		"-rtsp_transport", "tcp",
-		"-fflags", "nobuffer",
-		"-flags", "low_delay",
-		"-i", rtspURL,
-		"-filter_complex", filter,
-		"-map", "[v1080]",
-		"-map", "[v720]",
-		"-map", "[v480]",
-		"-an",
-		"-c:v", "libx264",
-		"-preset", "veryfast",
-		"-tune", "zerolatency",
-		"-pix_fmt", "yuv420p",
-		"-b:v:0", "5000k",
-		"-b:v:1", "2500k",
-		"-b:v:2", "1000k",
-		"-maxrate:v:0", "5500k",
-		"-maxrate:v:1", "2800k",
-		"-maxrate:v:2", "1200k",
-		"-g", "50",
-		"-sc_threshold", "0",
-		"-f", "hls",
-		"-hls_time", "2",
-		"-hls_list_size", "6",
-		"-hls_flags",
-		"delete_segments+independent_segments+omit_endlist",
-		"-master_pl_name", "master.m3u8",
-		"-var_stream_map",
-		"v:0,name:1080p v:1,name:720p v:2,name:480p",
-		"-hls_segment_filename",
-		filepath.Join(outputDir, "%v", "segment_%06d.ts"),
-		filepath.Join(outputDir, "%v", "index.m3u8"),
-	}
+	log.Println("[HLS] Manager shutdown complete")
 }

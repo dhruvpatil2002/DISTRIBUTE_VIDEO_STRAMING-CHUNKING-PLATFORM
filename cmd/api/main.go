@@ -53,6 +53,7 @@ func main() {
 
 	// Register routes
 	handler, shutdownStreams, err := routes.New(db, cfg)
+	
 if err != nil {
     log.Fatalf("Route initialization failed: %v", err)
 }
@@ -86,6 +87,9 @@ defer shutdownStreams()
 
 		serverError <- server.ListenAndServe()
 	}()
+
+	
+
 
 	select {
 

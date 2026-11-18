@@ -13,3 +13,7 @@ web/dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+
+//curl.exe -u "video_backend:pass123" `
+>>   http://127.0.0.1:9997/v3/config/paths/list

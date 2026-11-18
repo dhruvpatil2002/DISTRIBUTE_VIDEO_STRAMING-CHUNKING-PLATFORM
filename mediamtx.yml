@@ -1,18 +1,34 @@
+
 logLevel: info
 
-# RTSP relay
 rtsp: yes
-rtspAddress: :8554
+rtspAddress: ":8554"
 
-# Control API: keep private
 api: yes
-apiAddress: 127.0.0.1:9997
+apiAddress: ":9997"
 
-# Disable MediaMTX's built-in HLS;
-# our Go service will generate HLS using FFmpeg.
 hls: no
 
-# Camera paths are dynamically registered by Go.
+authMethod: internal
+
+authInternalUsers:
+  # Go backend service account
+  - user: video_backend
+    pass: "pass123"
+    ips: []
+    permissions:
+      - action: api
+
+  # Allow RTSP publishing and reading
+  # Development-only access policy
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+
 paths:
   all_others:
     source: publisher

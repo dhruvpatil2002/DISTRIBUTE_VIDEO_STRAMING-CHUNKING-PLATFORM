@@ -16,18 +16,20 @@ import (
 type MediaMTXManager struct {
 	APIURL     string
 	RTSPURL    string
-	HTTPClient *http.Client
+	 APIUser    string
+    APIPass    string
+    HTTPClient *http.Client
+	
 }
 
 func NewMediaMTXManager(
-	apiURL string,
-	rtspURL string,
+	apiURL, rtspURL, apiUser, apiPass string,
 ) *MediaMTXManager {
-
 	return &MediaMTXManager{
 		APIURL:  strings.TrimRight(apiURL, "/"),
 		RTSPURL: strings.TrimRight(rtspURL, "/"),
-
+		APIUser: apiUser,
+		APIPass: apiPass,
 		HTTPClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
@@ -157,30 +159,61 @@ func (m *MediaMTXManager) UpdateCamera(
 	)
 }
 
-// RemoveCamera removes a registered camera.
 func (m *MediaMTXManager) RemoveCamera(
-	ctx context.Context,
-	cameraID string,
+    ctx context.Context,
+    cameraID string,
 ) error {
+    if err := validateCameraID(cameraID); err != nil {
+        return err
+    }
 
-	if err := validateCameraID(cameraID); err != nil {
-		return err
-	}
+    endpoint := fmt.Sprintf(
+        "%s/v3/config/paths/delete/%s",
+        m.APIURL,
+        url.PathEscape(cameraPath(cameraID)),
+    )
 
-	endpoint := fmt.Sprintf(
-		"%s/v3/config/paths/delete/%s",
-		m.APIURL,
-		url.PathEscape(cameraPath(cameraID)),
-	)
+    req, err := http.NewRequestWithContext(
+        ctx,
+        http.MethodPost,
+        endpoint,
+        nil,
+    )
+    if err != nil {
+        return fmt.Errorf("create MediaMTX delete request: %w", err)
+    }
 
-	return m.doRequest(
-		ctx,
-		http.MethodPost,
-		endpoint,
-		nil,
-	)
+    req.SetBasicAuth(m.APIUser, m.APIPass)
+
+    client := m.HTTPClient
+    if client == nil {
+        client = &http.Client{Timeout: 5 * time.Second}
+    }
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return fmt.Errorf("MediaMTX delete request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode == http.StatusNotFound {
+        // Treat an already-absent relay as successful cleanup.
+        // This assumes the API endpoint itself is valid.
+        return nil
+    }
+
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+        return fmt.Errorf(
+            "MediaMTX delete failed: status=%d response=%s",
+            resp.StatusCode,
+            strings.TrimSpace(string(body)),
+        )
+    }
+
+    return nil
 }
-
 // GetCameraRTSPURL returns the internal relay URL.
 // FFmpeg reads from MediaMTX, not directly from the camera.
 func (m *MediaMTXManager) GetCameraRTSPURL(
@@ -227,7 +260,7 @@ func (m *MediaMTXManager) doRequest(
 	if err != nil {
 		return err
 	}
-
+	req.SetBasicAuth(m.APIUser, m.APIPass)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -258,4 +291,69 @@ func (m *MediaMTXManager) doRequest(
 	}
 
 	return nil
+}
+
+func (m *MediaMTXManager) EnsureCamera(
+    ctx context.Context,
+    cameraID string,
+    rtspURL string,
+) error {
+    if err := validateCameraID(cameraID); err != nil {
+        return err
+    }
+
+    if err := validateSourceURL(rtspURL); err != nil {
+        return err
+    }
+
+    path := url.PathEscape(cameraPath(cameraID))
+
+    // Check whether the camera path exists.
+    getURL := fmt.Sprintf(
+        "%s/v3/config/paths/get/%s",
+        m.APIURL,
+        path,
+    )
+
+    req, err := http.NewRequestWithContext(
+        ctx,
+        http.MethodGet,
+        getURL,
+        nil,
+    )
+    if err != nil {
+        return err
+    }
+
+    req.SetBasicAuth(m.APIUser, m.APIPass)
+
+    client := m.HTTPClient
+    if client == nil {
+        client = &http.Client{Timeout: 5 * time.Second}
+    }
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return fmt.Errorf("check MediaMTX path: %w", err)
+    }
+
+    // Close the response before sending another request.
+    io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+    resp.Body.Close()
+
+    switch resp.StatusCode {
+    case http.StatusOK:
+        // Already exists: synchronize its configuration.
+        return m.UpdateCamera(ctx, cameraID, rtspURL)
+
+    case http.StatusNotFound:
+        // Missing: create the path.
+        return m.RegisterCamera(ctx, cameraID, rtspURL)
+
+    default:
+        return fmt.Errorf(
+            "check MediaMTX path failed: HTTP %d",
+            resp.StatusCode,
+        )
+    }
 }

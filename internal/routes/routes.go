@@ -1,154 +1,315 @@
 package routes
 
 import (
-    "context"
-    "fmt"
-    "net/http"
-    "log"
-    "time"
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
 
-    "github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 
-    "github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/config"
-    "github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/handler"
-    "github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/repository"
-    "github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/service"
-    "github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/stream"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/auth"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/config"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/handlers"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/models"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/repository"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/service"
+	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/stream"
 )
 
 func New(
-    db *pgxpool.Pool,
-    cfg *config.Config,
+	db *pgxpool.Pool,
+	cfg *config.Config,
 ) (http.Handler, func(), error) {
 
-    mux := http.NewServeMux()
+	mux := http.NewServeMux()
 
-    // Repositories
-    siteRepo := repository.NewSiteRepository(db)
-    cameraRepo := repository.NewCameraRepository(db)
+	// =========================
+	// Repositories
+	// =========================
 
-    // Stream managers
-    rtspManager := stream.NewMediaMTXManager(
-        cfg.MediaMTXAPI,
-        cfg.MediaMTXRTSP,
+	userRepo := repository.NewUserRepository(db)
+	siteRepo := repository.NewSiteRepository(db)
+	cameraRepo := repository.NewCameraRepository(db)
+
+	// =========================
+	// Services
+	// =========================
+
+	userService := service.NewUserService(
+		userRepo,
+		cfg.JWTSecret,
+	)
+
+	siteService := service.NewSiteService(siteRepo)
+
+	// =========================
+	// Authentication Middleware
+	// =========================
+
+	authMiddleware := auth.Middleware(userService)
+
+	// =========================
+	// Stream Managers
+	// =========================
+
+	log.Printf(
+		"MediaMTX: API=%s, userConfigured=%t, passwordConfigured=%t",
+		cfg.MediaMTXAPI,
+		cfg.MediaMTXAPIUser != "",
+		cfg.MediaMTXAPIPassword != "",
+	)
+
+	rtspManager := stream.NewMediaMTXManager(
+		cfg.MediaMTXAPI,
+		cfg.MediaMTXRTSP,
+		cfg.MediaMTXAPIUser,
+		cfg.MediaMTXAPIPassword,
+	)
+
+	hlsManager := stream.NewHLSManager(
+		cfg.FFmpegPath,
+		cfg.HLSDir,
+		cfg.StreamGracePeriod,
+		time.Minute,
+		2*time.Second,
+		5,
+	)
+
+	// =========================
+	// Restore Registered Cameras
+	// =========================
+// =========================
+// Restore Registered Cameras
+// =========================
+
+ctx, cancel := context.WithTimeout(
+    context.Background(),
+    30*time.Second,
+)
+defer cancel()
+
+cameras, err := cameraRepo.GetAllForStreaming(ctx)
+if err != nil {
+    hlsManager.Shutdown()
+
+    return nil, nil, fmt.Errorf(
+        "load registered cameras: %w",
+        err,
+    )
+}
+
+for _, camera := range cameras {
+    log.Printf(
+        "Restoring camera %s into MediaMTX",
+        camera.ID,
     )
 
-   hlsManager := stream.NewHLSManager(
-    cfg.FFmpegPath,
-    cfg.HLSDir,
-    cfg.StreamGracePeriod,
-    time.Minute,
-    2*time.Second,
-    5,
-)
+    err := rtspManager.EnsureCamera(
+        ctx,
+        camera.ID,
+        camera.RTSPURL,
+    )
 
-    // Restore registered cameras.
-    ctx := context.Background()
-
-    cameras, err := cameraRepo.GetAllForStreaming(ctx)
     if err != nil {
         hlsManager.Shutdown()
+
         return nil, nil, fmt.Errorf(
-            "load registered cameras: %w", err,
+            "restore camera %s: %w",
+            camera.ID,
+            err,
         )
     }
 
-    for _, camera := range cameras {
-        if err := rtspManager.RegisterCamera(
-            ctx,
-            camera.ID,
-            camera.RTSPURL,
-        ); err != nil {
-            hlsManager.Shutdown()
-            return nil, nil, fmt.Errorf(
-                "restore camera %s: %w",
-                camera.ID,
-                err,
-            )
-        }
-
-        log.Printf(
-            "Registered RTSP source for camera %s",
-            camera.ID,
-        )
-    }
-
-    // Services
-    siteService := service.NewSiteService(siteRepo)
-
-    cameraService := service.NewCameraService(
-        cameraRepo,
-        rtspManager,
-        hlsManager,
+    log.Printf(
+        "Camera %s synchronized with MediaMTX",
+        camera.ID,
     )
+}
 
-    // Handlers
-    siteHandler := handlers.NewSiteHandler(siteService)
-    cameraHandler := handlers.NewCameraHandler(cameraService)
-    playbackHandler := handlers.NewPlaybackHandler(cameraService)
-
-    // Site routes
-    mux.HandleFunc("POST /api/sites", siteHandler.Create)
-    mux.HandleFunc("GET /api/sites", siteHandler.GetAll)
-    mux.HandleFunc("GET /api/sites/{siteID}", siteHandler.GetByID)
-    mux.HandleFunc("PUT /api/sites/{siteID}", siteHandler.Update)
-    mux.HandleFunc("DELETE /api/sites/{siteID}", siteHandler.Delete)
-
-    // Camera routes
-    mux.HandleFunc(
-        "POST /api/sites/{siteID}/cameras",
-        cameraHandler.Create,
-    )
-
-    mux.HandleFunc(
-        "GET /api/sites/{siteID}/cameras",
-        cameraHandler.GetAllBySite,
-    )
-
-    mux.HandleFunc(
-        "GET /api/cameras/{cameraID}",
-        cameraHandler.GetByID,
-    )
-
-    mux.HandleFunc(
-        "PUT /api/cameras/{cameraID}",
-        cameraHandler.Update,
-    )
-
-    mux.HandleFunc(
-        "DELETE /api/cameras/{cameraID}",
-        cameraHandler.Delete,
-    )
-
-    // Playback routes
-    mux.HandleFunc(
-        "POST /api/cameras/{cameraID}/playback",
-        playbackHandler.Start,
-    )
-
-    mux.HandleFunc(
-        "DELETE /api/playback/{leaseID}",
-        playbackHandler.Stop,
-    )
-	mux.HandleFunc(
-    "POST /api/playback/{leaseID}/heartbeat",
-    playbackHandler.Heartbeat,
+log.Printf(
+    "Camera restoration completed: %d cameras",
+    len(cameras),
 )
 
-    // HLS file serving
-    mux.Handle(
-        "GET /hls/streams/",
-        http.StripPrefix(
-            "/hls/streams/",
-            http.FileServer(
-                http.Dir(cfg.HLSDir),
-            ),
+	// =========================
+	// Camera Service
+	// =========================
+
+	cameraService := service.NewCameraService(
+		cameraRepo,
+		rtspManager,
+		hlsManager,
+	)
+
+	// =========================
+	// Handlers
+	// =========================
+
+	userHandler := handlers.NewUserHandler(userService)
+
+	siteHandler := handlers.NewSiteHandler(
+		siteService,
+	)
+
+	cameraHandler := handlers.NewCameraHandler(
+		cameraService,
+	)
+
+	playbackHandler := handlers.NewPlaybackHandler(
+		cameraService,
+	)
+
+	// =========================
+	// Public Routes
+	// =========================
+
+	mux.HandleFunc(
+		"GET /health",
+		handlers.Health(),
+	)
+
+	// User Registration
+	mux.HandleFunc(
+		"POST /api/auth/register",
+		userHandler.Register,
+	)
+
+	// User Login
+	mux.HandleFunc(
+		"POST /api/auth/login",
+		userHandler.Login,
+	)
+
+	// =========================
+	// Protected Authentication Routes
+	// =========================
+
+	protected := func(h http.Handler) http.Handler {
+		return authMiddleware(h)
+	}
+
+	adminOnly := func(h http.Handler) http.Handler {
+		return authMiddleware(
+			auth.RequireRole("admin")(h),
+		)
+	}
+
+	// =========================
+	// Protected Site Routes
+	// =========================
+	mux.Handle(
+		 "GET /api/admin/users",
+    auth.Middleware(userService)(
+        auth.RequireRole(models.RoleAdmin)(
+            http.HandlerFunc(userHandler.GetAllUsers),),
+		),
+	)
+
+
+	mux.Handle(
+    "PATCH /api/admin/users/{id}/role",
+    auth.Middleware(userService)(
+        auth.RequireRole(models.RoleAdmin)(
+            http.HandlerFunc(userHandler.UpdateRole),
         ),
-    )
+    ),
+)
+	mux.Handle(
+		"POST /api/sites",
+		adminOnly(http.HandlerFunc(siteHandler.Create)),
+	)
 
-    shutdown := func() {
-        hlsManager.Shutdown()
-    }
+	mux.Handle(
+		"GET /api/sites/{siteID}",
+		protected(http.HandlerFunc(siteHandler.GetByID)),
+	)
 
-    return mux, shutdown, nil
+	mux.Handle(
+		"PUT /api/sites/{siteID}",
+		adminOnly(http.HandlerFunc(siteHandler.Update)),
+	)
+
+	mux.Handle(
+		"DELETE /api/sites/{siteID}",
+		adminOnly(http.HandlerFunc(siteHandler.Delete)),
+	)
+	mux.Handle(
+		"GET /api/sites/getAll",
+		protected(http.HandlerFunc(siteHandler.GetAll)),
+	)
+
+	// =========================
+	// Protected Camera Routes
+	// =========================
+
+	// =========================
+	// Camera Routes
+	// =========================
+
+	// Admin: Camera management
+	mux.Handle(
+		"POST /api/sites/{siteID}/cameras",
+		adminOnly(http.HandlerFunc(cameraHandler.Create)),
+	)
+
+	mux.Handle(
+		"PUT /api/cameras/{cameraID}",
+		adminOnly(http.HandlerFunc(cameraHandler.Update)),
+	)
+
+	mux.Handle(
+		"DELETE /api/cameras/{cameraID}",
+		adminOnly(http.HandlerFunc(cameraHandler.Delete)),
+	)
+
+	// User + Admin: Camera viewing
+	mux.Handle(
+		"GET /api/sites/{siteID}/cameras",
+		protected(http.HandlerFunc(cameraHandler.GetAllBySite)),
+	)
+
+	mux.Handle(
+		"GET /api/cameras/{cameraID}",
+		protected(http.HandlerFunc(cameraHandler.GetByID)),
+	)
+
+	mux.Handle(
+		"POST /api/cameras/{cameraID}/playback",
+		protected(http.HandlerFunc(playbackHandler.Start)),
+	)
+
+	mux.Handle(
+		"DELETE /api/playback/{leaseID}",
+		protected(http.HandlerFunc(playbackHandler.Stop)),
+	)
+
+	mux.Handle(
+		"POST /api/playback/{leaseID}/heartbeat",
+		protected(http.HandlerFunc(playbackHandler.Heartbeat)),
+	)
+	// =========================
+	// HLS File Serving
+	// =========================
+
+	mux.Handle(
+		"GET /hls/streams/",
+		http.StripPrefix(
+			"/hls/streams/",
+			http.FileServer(
+				http.Dir(cfg.HLSDir),
+			),
+		),
+	)
+
+	// =========================
+	// Shutdown
+	// =========================
+
+	shutdown := func() {
+		hlsManager.Shutdown()
+	}
+
+	return mux, shutdown, nil
 }

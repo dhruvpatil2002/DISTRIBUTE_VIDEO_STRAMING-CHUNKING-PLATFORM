@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-
+	"log"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/dhruvpatil2002/distribute-video-streaming-chunking-platform/internal/models"
@@ -229,126 +229,97 @@ func (s *CameraService) Update(
 	return camera, nil
 }
 
-// Delete removes the relay and camera record.
 func (s *CameraService) Delete(
-	ctx context.Context,
-	cameraID string,
-	userID string,
+    ctx context.Context,
+    cameraID string,
+    userID string,
 ) error {
+    camera, err := s.Repo.GetByID(ctx, cameraID, userID)
+    if errors.Is(err, pgx.ErrNoRows) {
+        return ErrNotFound
+    }
+    if err != nil {
+        return fmt.Errorf("fetch camera: %w", err)
+    }
 
-	camera, err := s.Repo.GetByID(
-		ctx,
-		cameraID,
-		userID,
-	)
+    log.Printf("Deleting camera %s: removing MediaMTX relay", cameraID)
 
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
+    if err := s.RTSP.RemoveCamera(ctx, camera.ID); err != nil {
+        return fmt.Errorf("MediaMTX relay deletion failed: %w", err)
+    }
 
-	if err != nil {
-		return err
-	}
+    log.Printf("Deleting camera %s: removing PostgreSQL record", cameraID)
 
-	// Remove MediaMTX path first.
-	if err := s.RTSP.RemoveCamera(
-		ctx,
-		camera.ID,
-	); err != nil {
-		return fmt.Errorf(
-			"failed to remove camera relay: %w",
-			err,
-		)
-	}
+    if err := s.Repo.Delete(ctx, cameraID, userID); err != nil {
+        if errors.Is(err, pgx.ErrNoRows) {
+            return ErrNotFound
+        }
 
-	// Remove camera from PostgreSQL.
-	if err := s.Repo.Delete(
-		ctx,
-		cameraID,
-		userID,
-	); err != nil {
-		return err
-	}
+        return fmt.Errorf(
+            "failed to delete camera from PostgreSQL: %w",
+            err,
+        )
+    }
 
-	return nil
+    log.Printf("Camera %s deleted successfully", cameraID)
+    return nil
 }
-
-// StartPlayback starts or reuses the camera's HLS process.
+// StartPlayback validates ownership and starts HLS.
 func (s *CameraService) StartPlayback(
-	ctx context.Context,
-	cameraID string,
-	userID string,
+    ctx context.Context,
+    cameraID string,
+    userID string,
 ) (string, string, error) {
 
-	// 1. Verify camera ownership.
-	camera, err := s.Repo.GetByID(
-		ctx,
-		cameraID,
-		userID,
-	)
+    camera, err := s.Repo.GetByID(ctx, cameraID, userID)
+    if err != nil {
+        if errors.Is(err, pgx.ErrNoRows) {
+            return "", "", ErrNotFound
+        }
+        return "", "", fmt.Errorf("get camera: %w", err)
+    }
 
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", "", ErrNotFound
-		}
+    relayURL, err := s.RTSP.GetCameraRTSPURL(camera.ID)
+    if err != nil {
+        return "", "", fmt.Errorf("get camera relay: %w", err)
+    }
 
-		return "", "", err
-	}
+    leaseID, playlistURL, err := s.HLS.Acquire(
+        camera.ID,
+        relayURL,
+        userID,
+    )
+    if err != nil {
+        return "", "", fmt.Errorf("acquire playback: %w", err)
+    }
 
-	// 2. Get internal MediaMTX RTSP URL.
-	relayURL, err := s.RTSP.GetCameraRTSPURL(
-		camera.ID,
-	)
+    if err := s.HLS.WaitUntilReady(ctx, camera.ID); err != nil {
+        // Release the lease if startup fails.
+        _ = s.HLS.Release(leaseID, userID)
 
-	if err != nil {
-		return "", "", err
-	}
+        return "", "", fmt.Errorf(
+            "wait for playback readiness: %w",
+            err,
+        )
+    }
 
-	// 3. Acquire playback lease.
-	leaseID, playlistURL, err := s.HLS.Acquire(
-		camera.ID,
-		relayURL,
-		userID,
-	)
-
-	if err != nil {
-		return "", "", err
-	}
-
-	// 4. Wait for FFmpeg readiness.
-	if err := s.HLS.WaitUntilReady(
-		ctx,
-		camera.ID,
-	); err != nil {
-
-		s.HLS.Release(leaseID)
-
-		return "", "", err
-	}
-
-	return leaseID, playlistURL, nil
+    return leaseID, playlistURL, nil
 }
 
-// StopPlayback releases a viewer lease.
+// StopPlayback releases the authenticated viewer's lease.
 func (s *CameraService) StopPlayback(
-	ctx context.Context,
-	leaseID string,
-	userID string,
+    ctx context.Context,
+    leaseID string,
+    userID string,
 ) error {
-
-	s.HLS.Release(leaseID)
-	return nil
+    return s.HLS.Release(leaseID, userID)
 }
 
-// Heartbeat renews an active playback lease.
+// Heartbeat extends the viewer's lease TTL.
 func (s *CameraService) Heartbeat(
-	ctx context.Context,
-	leaseID string,
-	userID string,
+    ctx context.Context,
+    leaseID string,
+    userID string,
 ) error {
-
-	return s.HLS.Heartbeat(
-		leaseID,
-		userID,
-	)
+    return s.HLS.Heartbeat(leaseID, userID)
 }
